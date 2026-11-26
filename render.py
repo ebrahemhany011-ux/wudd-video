@@ -200,6 +200,43 @@ def set_palette(hue):
     GLOW = hsv(hue, 0.7, 0.7)
 
 
+def hex_rgb(hx):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(hx or "").strip())
+    if not m:
+        return None
+    v = m.group(1)
+    return tuple(int(v[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def set_palette_colors(main_hx, accent_hx):
+    """Exact customer colours: background = shades of `main` (any colour incl. black/grey),
+    accent = bright colour for titles/icons. Backgrounds stay dark-toned so white text stays readable."""
+    global BG_TOP, BG_BOT, GOLD, TEAL_D, CARD, LINE, PANEL, HEAD, GLOW
+    mr, ar_ = hex_rgb(main_hx), hex_rgb(accent_hx)
+    if mr is None:
+        return False
+    h, s, v = colorsys.rgb_to_hsv(*mr)
+    if v > 0.85 and s < 0.2:               # white/very light main: cannot be a background, keep a charcoal one
+        v, s = 0.25, 0.0
+    sat = min(0.95, s)
+    k = 0.55 + 0.45 * min(1.0, v / 0.6)      # darker input -> darker background
+    BG_TOP, BG_BOT = hsv(h, sat * 0.9, 0.40 * k), hsv(h + 0.02, min(1, sat), 0.13 * k)
+    if ar_ is not None:
+        ah, as_, av = colorsys.rgb_to_hsv(*ar_)
+        GOLD = hsv(ah, as_, max(av, 0.82)) if av < 0.82 and as_ > 0.05 else tuple(int(c * 255) for c in ar_)
+        if av < 0.3 and as_ < 0.2:
+            GOLD = (235, 235, 235)
+    else:
+        GOLD = hsv(h, max(0.0, sat * 0.5), 1.0) if sat > 0.1 else (235, 235, 235)
+    TEAL_D = hsv(h, sat, 0.22 * k)
+    CARD = hsv(h, sat * 0.9, 0.16 * k)
+    LINE = hsv(h, sat * 0.6, 0.52 * k + 0.1)
+    PANEL = hsv(h, sat, 0.11 * k)
+    HEAD = hsv(h, sat * 0.85, 0.26 * k)
+    GLOW = hsv(h, sat * 0.7, 0.7 * k + 0.1)
+    return True
+
+
 def pick_hue(plan_meta, text):
     h = hex_hue((plan_meta or {}).get("main")) if isinstance(plan_meta, dict) else None
     if h is not None:
@@ -872,7 +909,8 @@ def build_plan(script, brand=True):
         except Exception:
             data = None
     if data and isinstance(data.get("theme"), dict):
-        meta = {"main": str(data["theme"].get("main", ""))[:9]}
+        th = data["theme"]
+        meta = {"main": str(th.get("main", ""))[:9], "accent": str(th.get("accent", ""))[:9], "exact": bool(th.get("exact"))}
     if data and isinstance(data.get("scenes"), list):
         for sc in data["scenes"][:13]:
             if not isinstance(sc, dict):
@@ -1171,7 +1209,8 @@ def main():
         SHOW_LOGO = brand
         plan, meta = build_plan(P["script"], brand)
         alltext = " ".join(sc.get("say", "") + " " + sc.get("text", "") for sc in plan)
-        set_palette(pick_hue(meta, alltext))
+        if not (isinstance(meta, dict) and meta.get("exact") and set_palette_colors(meta.get("main"), meta.get("accent"))):
+            set_palette(pick_hue(meta, alltext))
         st = Style()
         chain = [voice]
         for v in ("ar-EG-SalmaNeural", "ar-EG-ShakirNeural"):
