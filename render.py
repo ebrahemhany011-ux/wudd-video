@@ -861,7 +861,7 @@ def split_sentences(t):
     return out[:14]
 
 
-def build_plan(script):
+def build_plan(script, brand=True):
     """Returns (scenes, meta). meta may carry {"main": "#hex"} from the script generator."""
     scenes, meta = [], {}
     s = script.strip()
@@ -908,7 +908,9 @@ def build_plan(script):
         scenes.append(dict(kind="problem", say=ss[0], text=clean(ss[0], 110), icon=""))
         for x in ss[1:]:
             scenes.append(dict(kind="benefit", say=x, title="", items=[clean(x, 110)], icons=[""]))
-    if not scenes or scenes[-1]["kind"] != "end":
+    if not brand:
+        scenes = [x for x in scenes if x["kind"] != "end"] or scenes
+    elif not scenes or scenes[-1]["kind"] != "end":
         scenes.append(dict(kind="end", say="جربه دلوقتي، الرابط في أول تعليق", text=""))
     for sc in scenes:
         sc["say"] = sc.get("say") or "."
@@ -917,6 +919,7 @@ def build_plan(script):
 
 # ---------- voice: text normalisation, sentence-by-sentence TTS, natural pauses ----------
 SAMPLE_RATE = 24000
+SHOW_LOGO = True
 SPOKEN_MAP = [
     (r"(?i)\bwhats\s?app\b", "واتساب"), (r"(?i)\btelegram\b", "تيليجرام"), (r"(?i)\bcrm\b", "سي آر إم"),
     (r"(?i)\bpdf\b", "بي دي إف"), (r"(?i)\bqr\b", "كيو آر"), (r"(?i)\bai\b", "الذكاء الاصطناعي"),
@@ -1048,7 +1051,7 @@ TAIL_S = 0.55        # breathing room after a scene's last word
 FADE_S = 0.6         # crossfade length
 
 
-def build_timeline(plan, voice, rate, pitch):
+def build_timeline(plan, voice, rate, pitch, novoice=False, target=0):
     """Returns (starts, scene_dur, marks, audio_array). starts[i] = when scene i's speech begins (global seconds)."""
     chunks, starts, durs, marks = [], [], [], []
     pos = 0.35   # global time of first speech
@@ -1058,8 +1061,16 @@ def build_timeline(plan, voice, rate, pitch):
     all_s = [sentences_for_tts(sc["say"]) for sc in plan]
     from concurrent.futures import ThreadPoolExecutor
     flat = [s for ss in all_s for s in ss]
-    with ThreadPoolExecutor(4) as ex:          # network-bound: fetch the sentences in parallel
-        audios = list(ex.map(lambda a: fade_edges(synth_sentence(a[1], voice, rate, pitch, a[0])), enumerate(flat)))
+    if novoice:        # silent video: each sentence stays on screen for its reading time, scaled to the target length
+        base = [max(1.3, len(x) * 0.065) for x in flat]
+        if target and base:
+            budget = max(2.0, target - 0.35 - 0.7 - PAUSE_S * len(flat) - 0.3 * len(plan))
+            f = budget / sum(base)
+            base = [max(1.0, b * f) for b in base]
+        audios = [sil(b) for b in base]
+    else:
+        with ThreadPoolExecutor(4) as ex:          # network-bound: fetch the sentences in parallel
+            audios = list(ex.map(lambda a: fade_edges(synth_sentence(a[1], voice, rate, pitch, a[0])), enumerate(flat)))
     for sc, sents in zip(plan, all_s):
         starts.append(pos); mk = []
         for j, s in enumerate(sents):
@@ -1074,7 +1085,10 @@ def build_timeline(plan, voice, rate, pitch):
     return starts, durs, marks, np.concatenate(chunks)
 
 
-def master_audio(wav_in, out_m4a):
+def master_audio(wav_in, out_m4a, silent=False):
+    if silent:
+        subprocess.run(["ffmpeg", "-y", "-i", wav_in, "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "64k", out_m4a], check=True, capture_output=True)
+        return
     af = "highpass=f=75,lowpass=f=11000,acompressor=threshold=-20dB:ratio=3:attack=8:release=120:makeup=3,loudnorm=I=-16:TP=-1.5:LRA=9"
     subprocess.run(["ffmpeg", "-y", "-i", wav_in, "-af", af, "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "160k", out_m4a],
                    check=True, capture_output=True)
@@ -1122,7 +1136,7 @@ def render_all(st, scenes, starts, total, audio_m4a, out, limit=None, frames_dir
         T = i / FPS
         k = max(j for j in range(n) if vis0[j] <= T + 1e-9)
         def draw(j):
-            f = base_frame(st, T, with_logo=(scenes[j].kind != "end"))
+            f = base_frame(st, T, with_logo=(scenes[j].kind != "end" and SHOW_LOGO))
             scenes[j].draw(f, T - vis0[j])
             return f
         f = draw(k)
@@ -1148,7 +1162,14 @@ def main():
     end_text = on_screen(clean(P.get("end_text"), 60))
     JOB = P["job_id"]
     try:
-        plan, meta = build_plan(P["script"])
+        novoice = bool(P.get("novoice")); brand = P.get("brand", True) is not False
+        try:
+            target = max(0, min(120, int(float(P.get("target_s") or 0))))
+        except Exception:
+            target = 0
+        global SHOW_LOGO
+        SHOW_LOGO = brand
+        plan, meta = build_plan(P["script"], brand)
         alltext = " ".join(sc.get("say", "") + " " + sc.get("text", "") for sc in plan)
         set_palette(pick_hue(meta, alltext))
         st = Style()
@@ -1159,18 +1180,28 @@ def main():
         if os.environ.get("GEMINI_TTS_KEY"):
             chain.append("gemini:" + (os.environ.get("GEMINI_TTS_VOICE") or "Kore"))
         built = None; errs = []
-        for v in chain:   # one voice for the whole video: if a voice fails on any sentence, redo all with the next one
-            try:
-                built = build_timeline(plan, v, rate, pitch)
-                print("voice used:", v)
-                break
-            except RuntimeError as e:
-                errs.append(str(e)[:150]); print("voice failed:", str(e)[:200])
+        if novoice:
+            built = build_timeline(plan, voice, rate, pitch, True, target)
+        else:
+            for v in chain:   # one voice for the whole video: if a voice fails on any sentence, redo all with the next one
+                try:
+                    built = build_timeline(plan, v, rate, pitch)
+                    print("voice used:", v)
+                    if target and built[3].size / SAMPLE_RATE > target * 1.3:   # too long for the asked length: speak faster once
+                        try:
+                            fast = build_timeline(plan, v, "+30%", pitch)
+                            if fast[3].size < built[3].size:
+                                built = fast
+                        except RuntimeError:
+                            pass
+                    break
+                except RuntimeError as e:
+                    errs.append(str(e)[:150]); print("voice failed:", str(e)[:200])
         if built is None:
             raise RuntimeError("tts failed all voices: " + " | ".join(errs)[:200])
         starts, durs, marks, audio = built
         write_wav("voice.wav", audio)
-        master_audio("voice.wav", "voice.m4a")
+        master_audio("voice.wav", "voice.m4a", novoice)
         scenes = []
         for sc, d, mk in zip(plan, durs, marks):
             s = make_scene(st, sc, d, link, end_text)
